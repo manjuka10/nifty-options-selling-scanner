@@ -110,27 +110,60 @@ NIFTY100 = [
 
 
 # ============================================================
-# KITE CONNECTION
+# KITE CONNECTION / LOGIN FLOW
 # ============================================================
-@st.cache_resource
-def get_kite():
-    api_key = st.secrets.get("KITE_API_KEY", "")
-    access_token = st.secrets.get("KITE_ACCESS_TOKEN", "")
+def _secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
-    if not api_key or not access_token:
+
+def kite_login_url(api_key):
+    return f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
+
+
+def generate_kite_session(api_key, api_secret, request_token):
+    kite = KiteConnect(api_key=api_key)
+    data = kite.generate_session(
+        request_token.strip(),
+        api_secret=api_secret,
+    )
+    access_token = data["access_token"]
+    kite.set_access_token(access_token)
+    kite.profile()
+    return kite, access_token
+
+
+def get_authenticated_kite():
+    api_key = _secret("KITE_API_KEY")
+    api_secret = _secret("KITE_API_SECRET")
+
+    # First preference: token generated during this Streamlit session.
+    access_token = st.session_state.get("kite_access_token", "")
+
+    # Optional fallback: a token stored in Streamlit Secrets.
+    if not access_token:
+        access_token = _secret("KITE_ACCESS_TOKEN")
+
+    if not api_key or not api_secret:
         return None, (
-            "Kite credentials are missing. Add KITE_API_KEY and "
-            "KITE_ACCESS_TOKEN in Streamlit Secrets."
+            "Kite login settings are missing. Add KITE_API_KEY and "
+            "KITE_API_SECRET in Streamlit Cloud → Settings → Secrets."
         )
+
+    if not access_token:
+        return None, None
 
     try:
         kite = KiteConnect(api_key=api_key)
         kite.set_access_token(access_token)
-
-        # Small authenticated test.
         kite.profile()
+        st.session_state["kite_access_token"] = access_token
         return kite, None
     except Exception as e:
+        # An expired/invalid stored token should not block the login UI.
+        st.session_state.pop("kite_access_token", None)
         return None, f"Kite connection failed: {e}"
 
 
@@ -670,13 +703,86 @@ st.caption(
     "Nifty 100 • Stock trend + extension + volatility + live Kite option-chain checks"
 )
 
-kite, kite_error = get_kite()
+# ------------------------------------------------------------
+# Kite authentication
+# ------------------------------------------------------------
+# Kite requires a manual login at least once per day. The app then
+# exchanges the short-lived request token for the day's access token.
+api_key = _secret("KITE_API_KEY")
+api_secret = _secret("KITE_API_SECRET")
 
-if kite_error:
-    st.error(kite_error)
-    st.info(
-        "Add KITE_API_KEY and KITE_ACCESS_TOKEN under "
-        "Streamlit Cloud → Settings → Secrets, then reboot the app."
+# If Kite redirects back to the app with ?request_token=..., capture it.
+try:
+    redirected_request_token = st.query_params.get("request_token", "")
+except Exception:
+    redirected_request_token = ""
+
+kite, kite_error = get_authenticated_kite()
+
+if kite is None:
+    if kite_error:
+        st.error(kite_error)
+        st.stop()
+
+    st.warning("Kite login is required for today's live option-chain data.")
+
+    if not api_key or not api_secret:
+        st.info(
+            "Add KITE_API_KEY and KITE_API_SECRET under "
+            "Streamlit Cloud → Settings → Secrets, then reboot the app."
+        )
+        st.stop()
+
+    st.markdown("### 🔐 Kite Login")
+    st.write(
+        "1. Tap the button below and log in to your Kite account. "
+        "2. After Kite redirects back to this app, copy the `request_token` "
+        "from the URL if it is not detected automatically. "
+        "3. Generate today's access token."
+    )
+
+    st.link_button(
+        "Open Kite Login",
+        kite_login_url(api_key),
+        use_container_width=True,
+    )
+
+    request_token = st.text_input(
+        "Request token",
+        value=redirected_request_token,
+        type="password",
+        help="Paste the request_token returned by Kite after successful login.",
+    ).strip()
+
+    if redirected_request_token:
+        st.success("Request token detected from the Kite redirect URL.")
+
+    if st.button("Generate Today's Access Token", type="primary", use_container_width=True):
+        if not request_token:
+            st.error("Please enter the request token first.")
+        else:
+            try:
+                with st.spinner("Generating today's Kite access token..."):
+                    new_kite, new_token = generate_kite_session(
+                        api_key,
+                        api_secret,
+                        request_token,
+                    )
+                st.session_state["kite_access_token"] = new_token
+                st.session_state["kite_login_success"] = True
+                st.success("Kite login successful. Today's live data is ready.")
+                # Remove the request token from the visible URL after use.
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.rerun()
+            except Exception as e:
+                st.error(f"Kite login failed: {e}")
+
+    st.caption(
+        "The access token is valid for the trading day. You normally need "
+        "to log in again on the next trading day."
     )
     st.stop()
 
